@@ -39,8 +39,7 @@ public:
           cache_(),
           node_manager_(3),
           http_server_(nullptr),
-          rpc_server_(nullptr),
-          stop_threads_(false) {
+          rpc_server_(nullptr) {
         
         // 节点管理器初始化完成
     }
@@ -49,58 +48,15 @@ public:
         stop();
     }
     
-    // 初始化线程池
+    // 线程池已移除，不再需要初始化线程池
     void initializeThreadPool(int num_threads = 16) {
-        // 创建指定数量的工作线程
-        for (int i = 0; i < num_threads; ++i) {
-            worker_threads_.emplace_back([this] {
-                while (!stop_threads_) {
-                    std::function<void()> task;
-                    
-                    {   // 加锁作用域
-                        std::unique_lock<std::mutex> lock(queue_mutex_);
-                        condition_.wait(lock, [this] { 
-                            return stop_threads_ || !task_queue_.empty(); 
-                        });
-                        
-                        if (stop_threads_ && task_queue_.empty())
-                            return;
-                        
-                        task = std::move(task_queue_.front());
-                        task_queue_.pop();
-                    }
-                    
-                    // 执行任务
-                    try {
-                        task();
-                    } catch (...) {
-                        // 静默处理异常
-                    }
-                }
-            });
-        }
-    }
-    
-    // 提交任务到线程池
-    template<class F, class... Args>
-    void submitTask(F&& f, Args&&... args) {
-        auto task = std::bind(std::forward<F>(f), std::forward<Args>(args)...);
-        
-        {   // 加锁作用域
-            std::unique_lock<std::mutex> lock(queue_mutex_);
-            task_queue_.emplace(task);
-        }
-        
-        condition_.notify_one();
+        // 不再需要创建线程池，所有请求直接处理
     }
     
     void run() {
         running_ = true;
         
         try {
-            // 初始化线程池
-            initializeThreadPool();
-            
             // 启动HTTP服务器
             startHttpServer();
             
@@ -114,16 +70,6 @@ public:
     
     void stop() {
         running_ = false;
-        
-        // 停止线程池
-        stop_threads_ = true;
-        condition_.notify_all();
-        for (auto& thread : worker_threads_) {
-            if (thread.joinable()) {
-                thread.join();
-            }
-        }
-        worker_threads_.clear();
         
         if (http_server_) {
             http_server_->stop();
@@ -142,33 +88,12 @@ public:
     
 private:
     void startHttpServer() {
-        // 创建libmicrohttpd服务器实例
+        // 创建libmicrohttpd服务器实例，所有请求都直接处理以提高性能
         http_server_ = new HttpServerLibmicrohttpd(
             std::stoi(port_), 
             [this](const std::string& url, const std::string& method, const std::string& body, const std::string& version, std::string& response, int& status_code) {
-                // 对于简单请求直接处理
-                if ((method == "GET" && (url == "/test" || url == "/health"))) {
-                    this->handleHttpRequest(url, method, body, response, status_code);
-                } else {
-                    // 对于写操作和复杂查询使用线程池异步处理
-                    std::shared_ptr<std::string> response_ptr = std::make_shared<std::string>();
-                    std::shared_ptr<int> status_ptr = std::make_shared<int>(200);
-                    
-                    // 创建临时缓冲区
-                    *response_ptr = "{\"status\":\"processing\"}";
-                    *status_ptr = 200;
-                    
-                    // 保存临时结果到输出参数
-                    response = *response_ptr;
-                    status_code = *status_ptr;
-                    
-                    // 使用线程池异步处理实际请求（无需返回结果）
-                    this->submitTask([this, url, method, body]() {
-                        std::string dummy_response;
-                        int dummy_status;
-                        this->handleHttpRequest(url, method, body, dummy_response, dummy_status);
-                    });
-                }
+                // 直接处理所有请求，移除不必要的异步处理
+                this->handleHttpRequest(url, method, body, response, status_code);
             }
         );
         
@@ -179,26 +104,12 @@ private:
     }
     
     void startRpcServer() {
-        // 创建libmicrohttpd RPC服务器实例
+        // 创建libmicrohttpd RPC服务器实例，直接处理RPC请求以提高性能
         rpc_server_ = new HttpServerLibmicrohttpd(
             std::stoi(rpc_port_),
             [this](const std::string& url, const std::string& method, const std::string& body, const std::string& version, std::string& response, int& status_code) {
-                // 使用线程池异步处理RPC请求
-                std::shared_ptr<std::string> response_ptr = std::make_shared<std::string>();
-                std::shared_ptr<int> status_ptr = std::make_shared<int>(200);
-                
-                // 创建临时缓冲区
-                *response_ptr = "{\"status\":\"processing\"}";
-                *status_ptr = 200;
-                
-                // 保存临时结果到输出参数
-                response = *response_ptr;
-                status_code = *status_ptr;
-                
-                // 异步处理实际的RPC请求
-                this->submitTask([this, body, response_ptr, status_ptr]() {
-                    this->handleRpcRequestLibmicrohttpd(body, *response_ptr, *status_ptr);
-                });
+                // 直接处理RPC请求，移除不必要的异步处理
+                this->handleRpcRequestLibmicrohttpd(body, response, status_code);
             }
         );
         
@@ -454,14 +365,7 @@ private:
     Cache cache_; 
     std::atomic<uint32_t> next_request_id_{0};
     
-    // 线程池用于异步请求处理
-    std::vector<std::thread> worker_threads_;
-    std::queue<std::function<void()>> task_queue_;
-    std::mutex queue_mutex_;
-    std::condition_variable condition_;
-    std::atomic<bool> stop_threads_;
-    
-    // 响应缓冲区和锁
+    // 响应缓冲区和锁（备用）
     std::mutex response_mutex_;
 };
 

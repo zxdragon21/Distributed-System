@@ -69,13 +69,13 @@ public:
             json_body["__rpc_type"] = type;
             std::string request_body = json_body.dump();
             
-            // 设置curl选项
+            // 设置curl选项，减少超时时间以提高性能
             curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
             curl_easy_setopt(curl, CURLOPT_POST, 1L);
             curl_easy_setopt(curl, CURLOPT_POSTFIELDS, request_body.c_str());
             curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, request_body.length());
-            curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 1500L);  // 1.5秒超时
-            curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 500L);  // 连接超时
+            curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 300L);  // 减少到300毫秒超时
+            curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 100L);  // 减少到100毫秒连接超时
             curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
             curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_body);
             

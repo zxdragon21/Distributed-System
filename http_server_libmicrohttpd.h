@@ -79,15 +79,15 @@ public:
 
     bool start() {
         // 创建MHD守护进程
-        // 使用通用配置，确保兼容性
+        // 减少线程池大小以优化性能，避免过多线程调度开销
         daemon_ = MHD_start_daemon(
             MHD_USE_INTERNAL_POLLING_THREAD,
             port_,
             nullptr, nullptr,
             &HttpServerLibmicrohttpd::staticHandlerCallback,
             this,
-            MHD_OPTION_THREAD_POOL_SIZE, 32,  // 增加线程池大小到32
-            MHD_OPTION_CONNECTION_TIMEOUT, 30,  // 连接超时30秒
+            MHD_OPTION_THREAD_POOL_SIZE, 8,  // 减少线程池大小到8
+            MHD_OPTION_CONNECTION_TIMEOUT, 10,  // 减少连接超时到10秒
             MHD_OPTION_LISTENING_ADDRESS_REUSE, 1,  // 允许地址重用
             MHD_OPTION_END);
 
