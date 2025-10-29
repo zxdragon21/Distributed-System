@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  node1:
+    build: .
+    ports:
+      - "127.0.0.1:9527:9527"  # 只映射 HTTP 端口，限制本地访问
+    command: ["./sdcs", "1"]
+    container_name: node1
+    networks:
+      - cache-network
+
+  node2:
+    build: .
+    ports:
+      - "127.0.0.1:9528:9528"  # 只映射 HTTP 端口，限制本地访问
+    command: ["./sdcs", "2"]
+    container_name: node2
+    networks:
+      - cache-network
+
+  node3:
+    build: .
+    ports:
+      - "127.0.0.1:9529:9529"  # 只映射 HTTP 端口，限制本地访问
+    command: ["./sdcs", "3"]
+    container_name: node3
+    networks:
+      - cache-network
+
+networks:
+  cache-network:
+    driver: bridge
