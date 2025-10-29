@@ -16,18 +16,28 @@
 #include <chrono>
 #include <atomic>
 
-// Workflow 头文件
-#include <workflow/WFTaskFactory.h>
-#include <workflow/WFHttpServer.h>
-#include <workflow/HttpUtil.h>
-#include <workflow/WFFacilities.h>
+// 使用libcurl代替Workflow进行HTTP客户端请求
+#include <curl/curl.h>
 
 #include "rpc_protocol.h"
+
+// curl回调函数
+static size_t WriteCallback(void* contents, size_t size, size_t nmemb, std::string* response) {
+    size_t total_size = size * nmemb;
+    response->append(static_cast<char*>(contents), total_size);
+    return total_size;
+}
 
 class RpcClient {
 public:
     RpcClient(const std::string& host, int port) : host_(host), port_(port), request_count_(0) {
-        // 移除不必要的日志输出
+        // 初始化libcurl
+        curl_global_init(CURL_GLOBAL_DEFAULT);
+    }
+    
+    ~RpcClient() {
+        // 清理libcurl
+        curl_global_cleanup();
     }
     
     std::string call(const RpcMessage& request) {
@@ -39,34 +49,13 @@ public:
     std::string sendRequest(const std::string& type, const std::string& body) {
         // 为避免死锁，简化RPC调用，使用较短的超时时间
         std::string url = "http://" + host_ + ":" + std::to_string(port_);
-        
-        // 创建一个新的WaitGroup，避免使用成员变量导致的潜在问题
-        WFFacilities::WaitGroup wait_group(1);
         std::string response_body = "{\"error\":\"timeout\"}";
         
         try {
-            WFHttpTask *task = WFTaskFactory::create_http_task(
-                url, 
-                500,   // 降低连接超时时间
-                1000,  // 降低回复超时时间
-                [&](WFHttpTask *task) {
-                    if (task->get_state() == WFT_STATE_SUCCESS) {
-                        protocol::HttpResponse *resp = task->get_resp();
-                        const void *body;
-                        size_t body_len;
-                        if (resp->get_parsed_body(&body, &body_len) && body_len > 0) {
-                            response_body = std::string(static_cast<const char*>(body), body_len);
-                        }
-                    } else {
-                        response_body = "{\"error\":\"rpc_error\"}";
-                    }
-                    wait_group.done();
-                }
-            );
-            
-            protocol::HttpRequest *req = task->get_req();
-            req->set_method("POST");
-            req->add_header_pair("Content-Type", "application/json");
+            CURL* curl = curl_easy_init();
+            if (!curl) {
+                return "{\"error\":\"curl_init_failed\"}";
+            }
             
             // 简化请求体构造
             nlohmann::json json_body;
@@ -78,12 +67,35 @@ public:
                 }
             }
             json_body["__rpc_type"] = type;
+            std::string request_body = json_body.dump();
             
-            req->append_output_body(json_body.dump());
-            task->start();
+            // 设置curl选项
+            curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+            curl_easy_setopt(curl, CURLOPT_POST, 1L);
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, request_body.c_str());
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, request_body.length());
+            curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 1500L);  // 1.5秒超时
+            curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 500L);  // 连接超时
+            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_body);
             
-            // 使用非阻塞模式，设置非常短的超时时间避免死锁
-            wait_group.wait(1500);  // 1.5秒超时
+            // 设置HTTP头
+            struct curl_slist *headers = NULL;
+            headers = curl_slist_append(headers, "Content-Type: application/json");
+            curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+            
+            // 执行请求
+            CURLcode res = curl_easy_perform(curl);
+            
+            // 清理资源
+            curl_slist_free_all(headers);
+            curl_easy_cleanup(curl);
+            
+            if (res != CURLE_OK) {
+                response_body = "{\"error\":\"rpc_error\"}";
+            } else if (response_body.empty()) {
+                response_body = "{\"error\":\"empty_response\"}";
+            }
             
         } catch (std::exception& e) {
             response_body = "{\"error\":\"rpc_error\"}";

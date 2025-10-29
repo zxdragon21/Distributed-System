@@ -4,14 +4,14 @@ project(SDCS)
 
 set(CMAKE_CXX_STANDARD 17)
 
-# 尝试查找Workflow库
-find_package(workflow REQUIRED)
+# 添加编译选项
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2 -pthread")
 
-# 如果没有找到，尝试使用pkg-config
-if(NOT workflow_FOUND)
-    find_package(PkgConfig REQUIRED)
-    pkg_check_modules(WORKFLOW REQUIRED libworkflow)
-endif()
+# 查找依赖库
+find_package(OpenSSL REQUIRED)
+find_package(Boost REQUIRED COMPONENTS system thread)
+find_package(CURL REQUIRED)
 
 add_executable(sdcs
     main.cpp
@@ -24,12 +24,7 @@ add_executable(sdcs
     gossip_protocol.h
 )
 
-target_include_directories(sdcs PRIVATE ${CMAKE_SOURCE_DIR})
+target_include_directories(sdcs PRIVATE ${CMAKE_SOURCE_DIR} ${OPENSSL_INCLUDE_DIR} ${Boost_INCLUDE_DIRS} ${CURL_INCLUDE_DIRS})
 
 # 链接库
-if(workflow_FOUND)
-    target_link_libraries(sdcs workflow pthread)
-else()
-    target_include_directories(sdcs PRIVATE ${WORKFLOW_INCLUDE_DIRS})
-    target_link_libraries(sdcs ${WORKFLOW_LIBRARIES} pthread)
-endif()
+target_link_libraries(sdcs ${OPENSSL_LIBRARIES} ${Boost_LIBRARIES} ${CURL_LIBRARIES} -lssl -lcrypto -lpthread -lmicrohttpd)

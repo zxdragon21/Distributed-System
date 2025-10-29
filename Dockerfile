@@ -16,28 +16,24 @@ RUN apt-get update && apt-get install -y \
     wget \
     curl \
     jq \
-    #libmicrohttpd-dev \
+    libmicrohttpd-dev \
     nlohmann-json3-dev \
     libssl-dev \
     libzmq3-dev \
     libboost-system-dev \
     libboost-thread-dev \
+    libcurl4-openssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# 从gitee下载并编译搜狗workflow库
-RUN git clone https://gitee.com/sogou/workflow.git && \
-    cd workflow && \
-    make install -j4 && \
-    ldconfig
+# 依赖库已在安装步骤中处理
 
 # 拷贝源代码
 COPY . .
 
 # 编译项目
-RUN g++ -std=c++17 -pthread -o2 -I. -I/usr/local/include/workflow main.cpp -o sdcs -lworkflow -lpthread
+RUN g++ -std=c++17 -pthread -O3 -I. -I/usr/local/include/workflow main.cpp -o sdcs -lmicrohttpd -lpthread -lcurl
 
 # 使用现有的启动脚本并传入启动节点数
-CMD ["./sdcs", "1"]
 

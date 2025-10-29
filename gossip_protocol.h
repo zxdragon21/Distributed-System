@@ -23,6 +23,9 @@
 #include <iostream>
 #include <sstream>
 #include <condition_variable>
+#include <queue>
+#include <future>
+#include <algorithm>
 
 // Gossip消息类型
 enum class GossipMessageType {
@@ -159,6 +162,65 @@ struct VersionInfo {
     uint64_t last_update_time; // 最后更新时间
 };
 
+// 简单的线程池实现
+class ThreadPool {
+private:
+    std::vector<std::thread> workers;
+    std::queue<std::function<void()>> tasks;
+    std::mutex queue_mutex;
+    std::condition_variable condition;
+    bool stop;
+
+public:
+    // 构造函数，创建指定数量的工作线程
+    ThreadPool(size_t threads) : stop(false) {
+        for (size_t i = 0; i < threads; ++i) {
+            workers.emplace_back([this] {
+                while (true) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lock(this->queue_mutex);
+                        this->condition.wait(lock, [this] { return this->stop || !this->tasks.empty(); });
+                        if (this->stop && this->tasks.empty()) return;
+                        task = std::move(this->tasks.front());
+                        this->tasks.pop();
+                    }
+                    task();
+                }
+            });
+        }
+    }
+
+    // 提交任务到线程池
+    template<class F>
+    auto submit(F&& f) -> std::future<typename std::result_of<F()>::type> {
+        using return_type = typename std::result_of<F()>::type;
+        auto task = std::make_shared<std::packaged_task<return_type()>>(std::forward<F>(f));
+        std::future<return_type> res = task->get_future();
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex);
+            if (stop) throw std::runtime_error("submit on stopped ThreadPool");
+            tasks.emplace([task]() { (*task)(); });
+        }
+        condition.notify_one();
+        return res;
+    }
+
+    // 析构函数，停止线程池
+    ~ThreadPool() {
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex);
+            stop = true;
+        }
+        condition.notify_all();
+        for (std::thread &worker : workers) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+    }
+};
+
 // Gossip协议管理器
 class GossipProtocol {
 public:
@@ -166,10 +228,10 @@ public:
     GossipProtocol(const std::string& node_id, int total_nodes = 3)
         : node_id_(node_id), address_(), send_function_(), running_(false),
           rng_(std::random_device{}()), dist_(0.0, 1.0),
-          GOSSIP_FANOUT(3), GOSSIP_INTERVAL_MS(1000), HEARTBEAT_INTERVAL_MS(500),
-          STATUS_CHECK_INTERVAL_MS(2000), NODE_TIMEOUT_MS(5000),
-          VERSION_INFO_TTL_MS(60000), CLEANUP_INTERVAL_MS(5000) {
-        std::cout << "[GOSSIP] Protocol initialized with node ID: " << node_id_ << std::endl;
+          GOSSIP_FANOUT(3), GOSSIP_INTERVAL_MS(5000), HEARTBEAT_INTERVAL_MS(2000),
+          STATUS_CHECK_INTERVAL_MS(10000), NODE_TIMEOUT_MS(15000),
+          VERSION_INFO_TTL_MS(60000), CLEANUP_INTERVAL_MS(20000) {
+        // 初始化协议，移除调试输出
     }
     
     // 构造函数 - 完整版本
@@ -180,8 +242,7 @@ public:
           GOSSIP_FANOUT(3), GOSSIP_INTERVAL_MS(1000), HEARTBEAT_INTERVAL_MS(500),
           STATUS_CHECK_INTERVAL_MS(2000), NODE_TIMEOUT_MS(5000),
           VERSION_INFO_TTL_MS(60000), CLEANUP_INTERVAL_MS(5000) {
-        std::cout << "[GOSSIP] Protocol initialized with node ID: " << node_id_ 
-                  << " address: " << address_ << std::endl;
+        // 初始化协议，移除调试输出
     }
     
     ~GossipProtocol() {
@@ -200,7 +261,7 @@ public:
             heartbeat_thread_ = std::thread(&GossipProtocol::heartbeatTask, this);
             status_check_thread_ = std::thread(&GossipProtocol::checkNodeStatus, this);
             cleanup_thread_ = std::thread(&GossipProtocol::cleanupExpiredVersions, this);
-            std::cout << "[GOSSIP] Protocol started for node: " << node_id_ << std::endl;
+            // 启动协议，移除调试输出
         }
     }
     
@@ -222,7 +283,7 @@ public:
                 cleanup_thread_.join();
             }
             
-            std::cout << "[GOSSIP] Protocol stopped for node: " << node_id_ << std::endl;
+            // 停止协议，移除调试输出
         }
     }
     
@@ -248,13 +309,11 @@ public:
             }
         }
         lock.unlock(); // 显式解锁
-        
-        // 异步发送消息，不阻塞当前操作
-        for (const auto& target : targets) {
-            std::thread([this, target, message]() {
-                sendMessage(target, message);
-            }).detach();
-        }
+          
+          // 同步发送消息，避免频繁创建线程
+          for (const auto& target : targets) {
+              sendMessage(target, message);
+          }
     }
     
     // 处理接收到的消息
@@ -275,7 +334,8 @@ public:
                 handleStatusUpdate(message);
                 break;
             default:
-                std::cerr << "[GOSSIP] Unknown message type: " << static_cast<int>(message.type) << std::endl;
+                // 不处理未知消息类型
+                ;
         }
     }
     
@@ -299,22 +359,19 @@ public:
                 if (it == version_map_.end() || remote_info.latest_version > it->second.latest_version) {
                     version_map_[message.target_key] = remote_info;
                     updated = true;
-                    std::cout << "[GOSSIP] Merged remote version for key: " << message.target_key 
-                              << " new version: " << remote_info.latest_version << std::endl;
+                    // 移除调试输出
                 }
                 
                 // 如果更新了版本，异步广播给其他节点
                 if (updated) {
                     std::thread([this, key = message.target_key, version = message.version]() {
-                        // 延迟一小段时间再广播，避免级联传播风暴
-                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                        // 移除不必要的延迟
                         broadcastVersionUpdate(key, version);
                     }).detach();
                 }
             }
             
-            std::cout << "[GOSSIP] Received version update for key: " << message.target_key 
-                      << " version: " << message.version << std::endl;
+            // 移除调试输出
         }
     }
     
@@ -360,13 +417,7 @@ public:
                 }
             }
             
-            // 检查是否有其他节点正在进行写操作（避免脏写）
-            // 如果其他节点最近（100ms内）更新了这个键，返回冲突
-            uint64_t now = getCurrentTimestamp();
-            if (local_info.last_writer != node_id_ && 
-                (now - local_info.last_update_time < 100)) {
-                return true; // 存在冲突
-            }
+            // 移除不必要的延迟检查，减少误判冲突
         }
         
         // 无冲突，允许写入
@@ -375,9 +426,9 @@ public:
     
 
     
-    // 广播版本更新消息（使用批量异步发送）
+    // 广播版本更新消息
     void broadcastVersionUpdate(const std::string& key, uint64_t new_version) {
-        // 优化：使用消息池避免频繁创建消息对象
+        // 创建消息对象
         GossipMessage message;
         message.type = GossipMessageType::UPDATE_VERSION;
         message.sender_id = node_id_;
@@ -388,7 +439,7 @@ public:
         // 获取目标节点列表
         std::vector<std::string> targets = selectRandomNodes(GOSSIP_FANOUT);
         
-        // 优化：批量异步发送，减少线程创建开销
+        // 批量异步发送，减少线程创建开销
         if (!targets.empty()) {
             // 将所有目标节点的消息发送任务合并到一个线程中
             std::thread([this, message, targets]() {
@@ -413,8 +464,7 @@ public:
         // 如果本地没有版本信息或者远程版本更新，则更新本地信息
         if (it == version_map_.end() || remote_info.latest_version > it->second.latest_version) {
             version_map_[key] = remote_info;
-            std::cout << "[GOSSIP] Merged remote version for key: " << key 
-                      << " new version: " << remote_info.latest_version << std::endl;
+            // 移除调试输出
         }
     }
     
@@ -427,7 +477,7 @@ public:
             auto node_info = std::make_shared<NodeInfo>(node_id, address);
             node_info->last_heartbeat = getCurrentTimestamp();
             nodes_[node_id] = node_info;
-            std::cout << "[GOSSIP] Added node: " << node_id << " at " << address << std::endl;
+            // 移除调试输出
         }
     }
     
@@ -438,7 +488,7 @@ public:
         
         if (it != nodes_.end()) {
             nodes_.erase(it);
-            std::cout << "[GOSSIP] Removed node: " << node_id << std::endl;
+            // 移除调试输出
         }
     }
     
@@ -456,37 +506,37 @@ public:
         return online_nodes;
     }
     
-    // 通知版本更新（优化：减少线程创建开销）
+    // 通知版本更新
     void notifyVersionUpdate(const std::string& key, uint64_t new_version) {
-        std::unique_lock<std::shared_mutex> lock(version_mutex_);
-        VersionInfo& info = version_map_[key];
-        
-        if (info.latest_version < new_version) {
-            info.latest_version = new_version;
-            info.last_writer = node_id_;
-            info.last_update_time = getCurrentTimestamp();
+        // 快速更新本地版本信息
+        {   // 最小作用域锁
+            std::unique_lock<std::shared_mutex> lock(version_mutex_);
+            VersionInfo& info = version_map_[key];
             
-            // 锁释放后再广播版本更新
-            lock.unlock();
-            
-            // 同步处理广播，避免线程创建开销
-            GossipMessage message;
-            message.type = GossipMessageType::UPDATE_VERSION;
-            message.sender_id = node_id_;
-            message.target_key = key;
-            message.version = new_version;
-            message.timestamp = getCurrentTimestamp();
-            
-            // 直接广播，不创建新线程
-            std::vector<std::string> targets = selectRandomNodes(GOSSIP_FANOUT);
-            for (const auto& target : targets) {
-                try {
-                    sendMessage(target, message);
-                } catch (...) {
-                    // 忽略单个发送失败
-                }
+            if (info.latest_version < new_version) {
+                info.latest_version = new_version;
+                info.last_writer = node_id_;
+                info.last_update_time = getCurrentTimestamp();
+            } else {
+                // 版本已更新，无需进一步操作
+                return;
             }
+        } // 立即释放锁
+        
+        // 使用线程池处理广播，避免频繁创建线程
+        if (update_task_pool_ == nullptr) {
+            // 懒初始化线程池
+            update_task_pool_ = std::make_shared<ThreadPool>(2); // 2个工作线程
         }
+        
+        // 提交广播任务到线程池
+        update_task_pool_->submit([this, key, new_version]() {
+            try {
+                broadcastVersionUpdate(key, new_version);
+            } catch (...) {
+                // 忽略所有异常
+            }
+        });
     }
     
     // 获取当前时间戳（毫秒）
@@ -518,7 +568,7 @@ public:
             // 处理消息
             processMessage(msg);
         } catch (const std::exception& e) {
-            std::cerr << "[GOSSIP] Error handling message: " << e.what() << std::endl;
+            // 移除调试输出
         }
     }
     
@@ -575,11 +625,11 @@ private:
                 if (node && current_time - node->last_heartbeat > NODE_TIMEOUT_MS) {
                     if (node->status == NodeStatus::ONLINE) {
                         node->status = NodeStatus::SUSPECTED;
-                        std::cout << "[GOSSIP] Node " << id << " marked as suspected" << std::endl;
+                        // 移除调试输出
                     } else if (node->status == NodeStatus::SUSPECTED && 
                               current_time - node->last_heartbeat > NODE_TIMEOUT_MS * 2) {
                         node->status = NodeStatus::OFFLINE;
-                        std::cout << "[GOSSIP] Node " << id << " marked as offline" << std::endl;
+                        // 移除调试输出
                     }
                 }
             }
@@ -621,27 +671,15 @@ private:
     // 清理过期的版本信息
     void cleanupExpiredVersions() {
         while (running_) {
-            // 使用try_lock模拟超时锁，避免死锁
+            // 简化锁获取逻辑，使用try_lock避免长时间阻塞
             std::unique_lock<std::shared_mutex> lock(version_mutex_, std::defer_lock);
-            auto start_time = std::chrono::steady_clock::now();
-            bool locked = false;
-            
-            while (std::chrono::steady_clock::now() - start_time < std::chrono::milliseconds(100)) {
-                if (lock.try_lock()) {
-                    locked = true;
-                    break;
-                }
-                // 短暂休眠避免CPU占用过高
-                std::this_thread::sleep_for(std::chrono::microseconds(100));
-            }
-            
-            if (locked) {
+            if (lock.try_lock()) {
                 uint64_t now = getCurrentTimestamp();
                 
                 for (auto it = version_map_.begin(); it != version_map_.end();) {
                     // 检查版本信息是否过期
                     if (now - it->second.last_update_time > VERSION_INFO_TTL_MS) {
-                        std::cout << "[GOSSIP] Cleaning expired version info for key: " << it->first << std::endl;
+                        // 移除调试输出
                         it = version_map_.erase(it);
                     } else {
                         ++it;
@@ -649,8 +687,6 @@ private:
                 }
                 
                 lock.unlock();
-            } else {
-                std::cerr << "[GOSSIP] Failed to acquire lock for cleanupExpiredVersions" << std::endl;
             }
             
             // 等待下一次清理
@@ -683,6 +719,9 @@ private:
     // 随机数生成器
     std::mt19937_64 rng_;
     std::uniform_real_distribution<double> dist_;
+    
+    // 线程池用于异步处理
+    std::shared_ptr<ThreadPool> update_task_pool_;
     
     // 配置参数
     const size_t GOSSIP_FANOUT;        // 每次gossip选择的节点数

@@ -6,78 +6,125 @@
  ************************************************************************/
 #ifndef CACHE_SERVER_H
 #define CACHE_SERVER_H
-#include <iostream>
 #include <string>
 #include <memory>
 #include <thread>
 #include <atomic>
 #include <csignal>
 #include <nlohmann/json.hpp>
+#include <vector>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <functional>
 
-// Workflow 头文件
-#include <workflow/WFFacilities.h>
-#include <workflow/WFHttpServer.h>
-#include <workflow/HttpUtil.h>
-#include <workflow/WFServer.h>
-#include <workflow/WFGlobal.h>
+// 替换为libmicrohttpd
+#include "http_server_libmicrohttpd.h"
 
 #include "cache.h"
 #include "node_manager.h"
 #include "rpc_protocol.h"
-#include "gossip_protocol.h"
 
-// 全局信号处理器
-static WFFacilities::WaitGroup wait_group(1);
-
-void sighandler(int signum) {
-    wait_group.done();
-}
 
 class CacheServer {
+private:
+    bool running_ = false;
+    
 public:
-    CacheServer(const std::string& node_id, const std::string& port, int total_nodes = 3) 
+    // 构造函数
+    CacheServer(const std::string& node_id, const std::string& port, const std::string& rpc_port, int worker_threads = 16)
         : node_id_(node_id), 
           port_(port), 
-          // RPC端口计算：9527->27080, 9528->27081, 9529->27082
-          rpc_port_(std::to_string(27080 + (std::stoi(port) - 9527))),
-          gossip_protocol_(std::make_shared<GossipProtocol>(node_id, total_nodes)),
-          cache_(gossip_protocol_),
-          node_manager_(total_nodes),
+          rpc_port_(rpc_port),
+          cache_(),
+          node_manager_(3),
           http_server_(nullptr),
-          rpc_server_(nullptr) {
+          rpc_server_(nullptr),
+          stop_threads_(false) {
         
-        // 设置信号处理
-        signal(SIGINT, sighandler);
-        signal(SIGTERM, sighandler);
-        
-        // 设置gossip协议到节点管理器
-        node_manager_.setGossipProtocol(gossip_protocol_);
+        // 节点管理器初始化完成
     }
     
     ~CacheServer() {
         stop();
     }
     
+    // 初始化线程池
+    void initializeThreadPool(int num_threads = 16) {
+        // 创建指定数量的工作线程
+        for (int i = 0; i < num_threads; ++i) {
+            worker_threads_.emplace_back([this] {
+                while (!stop_threads_) {
+                    std::function<void()> task;
+                    
+                    {   // 加锁作用域
+                        std::unique_lock<std::mutex> lock(queue_mutex_);
+                        condition_.wait(lock, [this] { 
+                            return stop_threads_ || !task_queue_.empty(); 
+                        });
+                        
+                        if (stop_threads_ && task_queue_.empty())
+                            return;
+                        
+                        task = std::move(task_queue_.front());
+                        task_queue_.pop();
+                    }
+                    
+                    // 执行任务
+                    try {
+                        task();
+                    } catch (...) {
+                        // 静默处理异常
+                    }
+                }
+            });
+        }
+    }
+    
+    // 提交任务到线程池
+    template<class F, class... Args>
+    void submitTask(F&& f, Args&&... args) {
+        auto task = std::bind(std::forward<F>(f), std::forward<Args>(args)...);
+        
+        {   // 加锁作用域
+            std::unique_lock<std::mutex> lock(queue_mutex_);
+            task_queue_.emplace(task);
+        }
+        
+        condition_.notify_one();
+    }
+    
     void run() {
+        running_ = true;
+        
         try {
+            // 初始化线程池
+            initializeThreadPool();
+            
             // 启动HTTP服务器
             startHttpServer();
             
             // 启动RPC服务器
             startRpcServer();
             
-            // 等待信号退出
-            wait_group.wait();
-            
         } catch (const std::exception& e) {
             // 静默处理异常
         }
-        
-        // 停止服务器
-        stop();
     }
     
     void stop() {
+        running_ = false;
+        
+        // 停止线程池
+        stop_threads_ = true;
+        condition_.notify_all();
+        for (auto& thread : worker_threads_) {
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+        worker_threads_.clear();
+        
         if (http_server_) {
             http_server_->stop();
             http_server_ = nullptr;
@@ -87,79 +134,109 @@ public:
             rpc_server_->stop();
             rpc_server_ = nullptr;
         }
-        
-        // 停止gossip协议
-        if (gossip_protocol_) {
-            gossip_protocol_->stop();
-        }
+    }
+    
+    bool isRunning() const {
+        return running_;
     }
     
 private:
     void startHttpServer() {
-        // 创建HTTP服务器实例
-        http_server_ = new WFHttpServer([this](WFHttpTask *task) {
-            this->registerHttpRoutes(task);
-        });
+        // 创建libmicrohttpd服务器实例
+        http_server_ = new HttpServerLibmicrohttpd(
+            std::stoi(port_), 
+            [this](const std::string& url, const std::string& method, const std::string& body, const std::string& version, std::string& response, int& status_code) {
+                // 对于简单请求直接处理
+                if ((method == "GET" && (url == "/test" || url == "/health"))) {
+                    this->handleHttpRequest(url, method, body, response, status_code);
+                } else {
+                    // 对于写操作和复杂查询使用线程池异步处理
+                    std::shared_ptr<std::string> response_ptr = std::make_shared<std::string>();
+                    std::shared_ptr<int> status_ptr = std::make_shared<int>(200);
+                    
+                    // 创建临时缓冲区
+                    *response_ptr = "{\"status\":\"processing\"}";
+                    *status_ptr = 200;
+                    
+                    // 保存临时结果到输出参数
+                    response = *response_ptr;
+                    status_code = *status_ptr;
+                    
+                    // 使用线程池异步处理实际请求（无需返回结果）
+                    this->submitTask([this, url, method, body]() {
+                        std::string dummy_response;
+                        int dummy_status;
+                        this->handleHttpRequest(url, method, body, dummy_response, dummy_status);
+                    });
+                }
+            }
+        );
         
         // 启动服务器
-        if (http_server_->start(std::stoi(port_)) != 0) {
+        if (!http_server_->start()) {
             throw std::runtime_error("Failed to start HTTP server");
         }
     }
     
     void startRpcServer() {
-        // 创建RPC服务器实例
-        rpc_server_ = new WFHttpServer([this](WFHttpTask *task) {
-            this->handleRpcRequest(task);
-        });
+        // 创建libmicrohttpd RPC服务器实例
+        rpc_server_ = new HttpServerLibmicrohttpd(
+            std::stoi(rpc_port_),
+            [this](const std::string& url, const std::string& method, const std::string& body, const std::string& version, std::string& response, int& status_code) {
+                // 使用线程池异步处理RPC请求
+                std::shared_ptr<std::string> response_ptr = std::make_shared<std::string>();
+                std::shared_ptr<int> status_ptr = std::make_shared<int>(200);
+                
+                // 创建临时缓冲区
+                *response_ptr = "{\"status\":\"processing\"}";
+                *status_ptr = 200;
+                
+                // 保存临时结果到输出参数
+                response = *response_ptr;
+                status_code = *status_ptr;
+                
+                // 异步处理实际的RPC请求
+                this->submitTask([this, body, response_ptr, status_ptr]() {
+                    this->handleRpcRequestLibmicrohttpd(body, *response_ptr, *status_ptr);
+                });
+            }
+        );
         
         // 启动服务器
-        if (rpc_server_->start(std::stoi(rpc_port_)) != 0) {
+        if (!rpc_server_->start()) {
             throw std::runtime_error("Failed to start RPC server");
         }
     }
     
-    void registerHttpRoutes(WFHttpTask *task) {
-        protocol::HttpRequest *req = task->get_req();
-        protocol::HttpResponse *resp = task->get_resp();
-        std::string method = req->get_method();
-        std::string path = req->get_request_uri();
-        
-        // 测试路由 - 保留但移除日志
-        if (method == "GET" && path == "/test") {
-            resp->set_status_code("200");
-            resp->append_output_body("Test OK from " + node_id_);
+    void handleHttpRequest(const std::string& url, const std::string& method, const std::string& body, std::string& response, int& status_code) {
+        // 测试路由
+        if (method == "GET" && url == "/test") {
+            response = "Test OK from " + node_id_;
+            status_code = 200;
             return;
         }
         
-        // 健康检查路由 - 保留但移除日志
-        if (method == "GET" && path == "/health") {
+        // 健康检查路由
+        if (method == "GET" && url == "/health") {
             nlohmann::json response_json = {
                 {"node", node_id_},
                 {"status", "healthy"},
                 {"http_port", port_},
                 {"rpc_port", rpc_port_}
             };
-            resp->set_status_code("200");
-            resp->add_header_pair("Content-Type", "application/json");
-            resp->append_output_body(response_json.dump());
+            response = response_json.dump();
+            status_code = 200;
             return;
         }
         
         // 写入/更新缓存
-        if (method == "POST" && path == "/") {
-            // 获取请求体
-            const void *body;
-            size_t body_len;
-            req->get_parsed_body(&body, &body_len);
-            std::string request_body(static_cast<const char*>(body), body_len);
-            
+        if (method == "POST" && url == "/") {
             try {
-                auto json = nlohmann::json::parse(request_body);
+                auto json = nlohmann::json::parse(body);
                 
                 if (json.size() != 1) {
-                    resp->set_status_code("400");
-                    resp->append_output_body("Only one key-value pair allowed");
+                    response = "Only one key-value pair allowed";
+                    status_code = 400;
                     return;
                 }
                 
@@ -190,24 +267,22 @@ private:
                     }
                 }
                 
-                // 快速响应，使用预定义的成功响应字符串
-                const char* success_response = "{\"status\":\"success\"}";
-                resp->set_status_code("200");
-                resp->add_header_pair("Content-Type", "application/json");
-                resp->append_output_body(success_response);
+                // 快速响应
+                response = "{\"status\":\"success\"}";
+                status_code = 200;
                 
             } catch (...) {
-                resp->set_status_code("400");
-                resp->append_output_body("Invalid JSON");
+                response = "Invalid JSON";
+                status_code = 400;
             }
             return;
         }
         
         // 读取缓存
-        if (method == "GET" && path.size() > 1) {
+        if (method == "GET" && url.size() > 1) {
             
             // 从URL路径获取key
-            std::string key = path.substr(1);  // 去掉开头的'/'
+            std::string key = url.substr(1);  // 去掉开头的'/'
             
             // 获取目标节点ID
             std::string target_node_id = node_manager_.getTargetNodeId(key);
@@ -218,19 +293,19 @@ private:
                     std::string value;
                     if (cache_.get(key, value)) {
                         try {
-                            // 使用nlohmann::json来正确构造响应，避免字符串拼接错误
+                            // 使用nlohmann::json来正确构造响应
                             nlohmann::json response_json;
                             // 解析value为JSON对象
                             response_json[key] = nlohmann::json::parse(value);
-                            resp->set_status_code("200");
-                            resp->add_header_pair("Content-Type", "application/json");
-                            resp->append_output_body(response_json.dump());
+                            response = response_json.dump();
+                            status_code = 200;
                         } catch (...) {
-                            resp->set_status_code("500");
-                            resp->append_output_body("Internal server error");
+                            response = "Internal server error";
+                            status_code = 500;
                         }
                     } else {
-                        resp->set_status_code("404");
+                        response = "Not found";
+                        status_code = 404;
                     }
                 } else {
                     // 使用NodeManager的RPC客户端发送GET请求
@@ -240,34 +315,34 @@ private:
                         auto response_json = nlohmann::json::parse(rpc_response);
                         if (response_json.contains("error")) {
                             if (response_json["error"] == "not_found") {
-                                resp->set_status_code("404");
+                                response = "Not found";
+                                status_code = 404;
                             } else {
-                                resp->set_status_code("500");
-                                resp->append_output_body("Internal server error");
+                                response = "Internal server error";
+                                status_code = 500;
                             }
                         } else if (response_json.contains(key)) {
-                            resp->set_status_code("200");
-                            resp->add_header_pair("Content-Type", "application/json");
-                            resp->append_output_body(response_json.dump());
+                            response = response_json.dump();
+                            status_code = 200;
                         }
                     } catch (...) {
-                        resp->set_status_code("500");
-                        resp->append_output_body("Internal server error");
+                        response = "Internal server error";
+                        status_code = 500;
                     }
                 }
             } catch (...) {
-                resp->set_status_code("500");
-                resp->append_output_body("Internal server error");
+                response = "Internal server error";
+                status_code = 500;
             }
             
             return;
         }
         
         // 删除缓存
-        if (method == "DELETE" && path.size() > 1) {
+        if (method == "DELETE" && url.size() > 1) {
             
             // 从URL路径获取key
-            std::string key = path.substr(1);  // 去掉开头的'/'
+            std::string key = url.substr(1);  // 去掉开头的'/'
             
             // 获取目标节点ID
             std::string target_node_id = node_manager_.getTargetNodeId(key);
@@ -302,34 +377,25 @@ private:
                     }
                 }
                 
-                resp->set_status_code("200");
-                resp->append_output_body(std::to_string(count));
+                response = std::to_string(count);
+                status_code = 200;
                 return; // 确保这里有return，避免继续执行到未匹配路由
                 
             } catch (...) {
-                resp->set_status_code("500");
-                resp->append_output_body("Internal server error");
+                response = "Internal server error";
+                status_code = 500;
                 return;
             }
         }
         
         // 未匹配的路由
-        resp->set_status_code("404");
-        resp->append_output_body("Not Found");
+        response = "Not Found";
+        status_code = 404;
     }
     
-    void handleRpcRequest(WFHttpTask *task) {
-        protocol::HttpRequest *req = task->get_req();
-        protocol::HttpResponse *resp = task->get_resp();
-        
-        // 获取请求体
-        const void *body;
-        size_t body_len;
-        req->get_parsed_body(&body, &body_len);
-        std::string request_body(static_cast<const char*>(body), body_len);
-        
+    void handleRpcRequestLibmicrohttpd(const std::string& body, std::string& response, int& status_code) {
         try {
-            auto json = nlohmann::json::parse(request_body);
+            auto json = nlohmann::json::parse(body);
             std::string rpc_type = json.value("__rpc_type", "");
             
             nlohmann::json response_json;
@@ -346,6 +412,8 @@ private:
                 } else {
                     response_json["error"] = "not_found";
                 }
+                response = response_json.dump();
+                status_code = 200;
             } else if (rpc_type == "SET") {
                 for (auto it = json.begin(); it != json.end(); ++it) {
                     if (it.key() != "__rpc_type") {
@@ -356,38 +424,45 @@ private:
                     }
                 }
                 // 快速响应
-                resp->set_status_code("200");
-                resp->add_header_pair("Content-Type", "application/json");
-                resp->append_output_body("{\"status\":\"success\"}");
-                return;
+                response = "{\"status\":\"success\"}";
+                status_code = 200;
             } else if (rpc_type == "DELETE") {
                 std::string key = json["key"];
                 // 不使用乐观锁删除
                 int count = cache_.remove(key);
                 response_json["count"] = count;
+                response = response_json.dump();
+                status_code = 200;
             } else {
                 response_json["error"] = "unknown_operation";
+                response = response_json.dump();
+                status_code = 200;
             }
             
-            resp->set_status_code("200");
-            resp->add_header_pair("Content-Type", "application/json");
-            resp->append_output_body(response_json.dump());
-            
         } catch (...) {
-            resp->set_status_code("400");
-            resp->append_output_body("Invalid request");
+            response = "Invalid request";
+            status_code = 400;
         }
     }
     
     std::string node_id_;
     std::string port_;
     std::string rpc_port_;
-    WFHttpServer *http_server_;
-    WFHttpServer *rpc_server_;
+    HttpServerLibmicrohttpd *http_server_;
+    HttpServerLibmicrohttpd *rpc_server_;
     NodeManager node_manager_;
-    std::shared_ptr<GossipProtocol> gossip_protocol_;
     Cache cache_; 
     std::atomic<uint32_t> next_request_id_{0};
+    
+    // 线程池用于异步请求处理
+    std::vector<std::thread> worker_threads_;
+    std::queue<std::function<void()>> task_queue_;
+    std::mutex queue_mutex_;
+    std::condition_variable condition_;
+    std::atomic<bool> stop_threads_;
+    
+    // 响应缓冲区和锁
+    std::mutex response_mutex_;
 };
 
 #endif

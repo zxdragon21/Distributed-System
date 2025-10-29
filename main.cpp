@@ -4,9 +4,11 @@
 	> Mail: 
 	> Created Time: Fri Oct  3 17:04:58 2025
  ************************************************************************/
+// 移除不必要的头文件
 #include <iostream>
 #include <string>
 #include "cache_server.h"
+#include "node_manager.h"
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
@@ -32,10 +34,21 @@ int main(int argc, char* argv[]) {
     std::cout << "  HTTP Port: " << port << std::endl;
     std::cout << "  Press Ctrl+C to stop the server" << std::endl;
     
+    // 设置信号处理
+    signal(SIGINT, [](int sig) {
+        std::cout << "Received interrupt signal, shutting down..." << std::endl;
+        exit(0);
+    });
+    
     try {
-        CacheServer server(node_id, port);
+        CacheServer server(node_id, port, std::to_string(27080 + node_index - 1));
         std::cout << "CacheServer created successfully, starting run..." << std::endl;
         server.run();
+        
+        // 等待信号退出
+        while (true) {
+            sleep(1);
+        }
     } catch (std::exception& e) {
         std::cerr << "Exception: " << e.what() << std::endl;
         return 1;
