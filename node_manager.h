@@ -109,6 +109,20 @@ public:
         }
     }
     
+    // 通用RPC请求发送方法，用于支持批量操作等复杂请求
+    std::string sendRpcRequest(const std::string& node_id, const std::string& request_body) {
+        try {
+            auto client = getRpcClientForNode(node_id);
+            // 直接发送原始请求体
+            auto result = client->sendRpcRequest(request_body);
+            
+            return result;
+        } catch (const std::exception& e) {
+            // std::cerr << "Error sending RPC request to node " << node_id << ": " << e.what() << std::endl;
+            return "{\"error\":\"rpc_error\"}";
+        }
+    }
+    
 private:
     std::vector<Node> nodes_;
     int total_nodes_;

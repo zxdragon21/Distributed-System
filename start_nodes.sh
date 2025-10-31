@@ -19,7 +19,7 @@ sleep 2
 echo "启动节点..."
 for i in $(seq 1 $total_nodes); do
     echo "启动节点$i"
-    ./sdcs $i $total_nodes &
+    ./build/sdcs $i $total_nodes &
 done
 
 echo "等待节点启动..."
