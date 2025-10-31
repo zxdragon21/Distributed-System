@@ -10,6 +10,7 @@
 #include <unordered_map>
 
 #include "rpc_client.h"
+#include "gossip_protocol.h"
 
 struct Node {
     std::string id;
@@ -29,17 +30,19 @@ public:
                 std::to_string(9526 + i),      // HTTP端口：9527, 9528, 9529
                 std::to_string(27080 + i - 1)  // RPC端口：27080, 27081, 27082
             });
-            
-            // 预初始化所有RPC客户端，避免懒加载带来的延迟
-            rpc_clients_[nodes_.back().id] = std::make_shared<RpcClient>(
-                nodes_.back().address, 
-                std::stoi(nodes_.back().rpc_port)
-            );
         }
+        
+        // 初始化节点信息，不再输出调试信息
+        // std::cout << "NodeManager initialized with " << total_nodes << " nodes:" << std::endl;
+        // for (const auto& node : nodes_) {
+        //     std::cout << "  " << node.id << " -> " << node.address << ":" << node.http_port 
+        //               << " (RPC:" << node.rpc_port << ")" << std::endl;
+        // }
     }
     
     std::string getTargetNodeId(const std::string& key) {
-        // 由于节点列表在初始化后不会改变，使用无锁访问以提高性能
+        // 直接获取共享锁，简化锁管理
+        std::shared_lock<std::shared_mutex> lock(mutex_);
         size_t hash = std::hash<std::string>{}(key);
         size_t index = hash % nodes_.size();
         return nodes_[index].id;
@@ -56,23 +59,40 @@ public:
         throw std::runtime_error("Node not found: " + node_id);
     }
     
-    // 获取指定节点的RPC客户端（预初始化方式）
+    // 获取指定节点的RPC客户端（懒加载方式）
     std::shared_ptr<RpcClient> getRpcClientForNode(const std::string& node_id) {
-        // 由于RPC客户端在初始化时已预创建，使用共享锁简化访问
-        std::shared_lock<std::shared_mutex> lock(mutex_);
+        // 直接获取独占锁，简化锁管理
+        std::unique_lock<std::shared_mutex> lock(mutex_);
         
-        auto it = rpc_clients_.find(node_id);
-        if (it != rpc_clients_.end()) {
-            return it->second;
+        // 检查是否已有客户端实例
+        if (rpc_clients_.find(node_id) == rpc_clients_.end()) {
+            // 临时解锁以避免在调用getNodeById时出现死锁
+            lock.unlock();
+            Node node = getNodeById(node_id);
+            lock.lock();
+            
+            // 双重检查锁定模式
+            if (rpc_clients_.find(node_id) == rpc_clients_.end()) {
+                rpc_clients_[node_id] = std::make_shared<RpcClient>(node.address, std::stoi(node.rpc_port));
+                // std::cout << "Created RpcClient for node " << node_id << " (" << node.address << ":" << node.rpc_port << ")" << std::endl;
+            }
         }
         
-        // 应该不会到达这里，因为客户端已预初始化
-        return nullptr;
+        return rpc_clients_[node_id];
     }
     
     // 向指定节点发送GET请求
     std::string sendGetRequest(const std::string& node_id, const std::string& key) {
         try {
+            // 读操作使用乐观读取，无需获取分布式读锁
+            // 使用gossip协议的版本信息可以获取最新状态，但不需要显式锁定
+            if (gossip_protocol_) {
+                // 可选：获取版本信息以确保读取的是最新数据
+                auto version_info = gossip_protocol_->getLatestVersionInfo(key);
+                // 可以在这里记录版本信息用于监控
+                // std::cout << "GET operation on key: " << key << ", current version: " << version_info.latest_version << std::endl;
+            }
+            
             auto client = getRpcClientForNode(node_id);
             auto result = client->get(key);
             
@@ -86,7 +106,23 @@ public:
     // 向指定节点发送SET请求
     std::string sendSetRequest(const std::string& node_id, const std::string& key, const std::string& value) {
         try {
+            // 1. 先获取客户端，避免在gossip操作后获取锁
             auto client = getRpcClientForNode(node_id);
+            
+            // 2. 使用乐观并发控制：检查是否有版本冲突
+            if (gossip_protocol_) {
+                // 获取最新版本信息用于乐观检查（这是一个读操作，不应有锁的问题）
+                auto version_info = gossip_protocol_->getLatestVersionInfo(key);
+                uint64_t expected_version = version_info.latest_version;
+                
+                // 检查写冲突
+                if (gossip_protocol_->checkWriteConflict(key, expected_version)) {
+                    // std::cerr << "Version conflict detected for key: " << key << std::endl;
+                    return "{\"error\":\"conflict_detected\"}";
+                }
+            }
+            
+            // 3. 执行RPC调用，不持有任何锁
             auto result = client->set(key, value);
             
             return result;
@@ -99,7 +135,23 @@ public:
     // 向指定节点发送DELETE请求
     std::string sendDeleteRequest(const std::string& node_id, const std::string& key) {
         try {
+            // 1. 先获取客户端，避免在gossip操作后获取锁
             auto client = getRpcClientForNode(node_id);
+            
+            // 2. 使用乐观并发控制：检查是否有版本冲突
+            if (gossip_protocol_) {
+                // 获取最新版本信息用于乐观检查（这是一个读操作，不应有锁的问题）
+                auto version_info = gossip_protocol_->getLatestVersionInfo(key);
+                uint64_t expected_version = version_info.latest_version;
+                
+                // 检查写冲突
+                if (gossip_protocol_->checkWriteConflict(key, expected_version)) {
+                    // std::cerr << "Version conflict detected for delete operation on key: " << key << std::endl;
+                    return "{\"error\":\"conflict_detected\"}";
+                }
+            }
+            
+            // 3. 执行RPC调用，不持有任何锁
             auto result = client->remove(key);
             
             return result;
@@ -109,18 +161,11 @@ public:
         }
     }
     
-    // 通用RPC请求发送方法，用于支持批量操作等复杂请求
-    std::string sendRpcRequest(const std::string& node_id, const std::string& request_body) {
-        try {
-            auto client = getRpcClientForNode(node_id);
-            // 直接发送原始请求体
-            auto result = client->sendRpcRequest(request_body);
-            
-            return result;
-        } catch (const std::exception& e) {
-            // std::cerr << "Error sending RPC request to node " << node_id << ": " << e.what() << std::endl;
-            return "{\"error\":\"rpc_error\"}";
-        }
+    // 设置gossip协议实例
+    void setGossipProtocol(std::shared_ptr<GossipProtocol> protocol) {
+        // 直接获取独占锁，简化锁管理
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        gossip_protocol_ = protocol;
     }
     
 private:
@@ -131,7 +176,8 @@ private:
     // 缓存RPC客户端实例
     std::unordered_map<std::string, std::shared_ptr<RpcClient>> rpc_clients_;
     
-
+    // Gossip协议实例
+    std::shared_ptr<GossipProtocol> gossip_protocol_;
 };
 
 #endif

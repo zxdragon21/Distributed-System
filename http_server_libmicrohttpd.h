@@ -49,26 +49,7 @@ private:
 
         // 调用用户定义的请求处理器
         request_handler_(url, method, *request_body, version, response_body, status_code);
-        
-        // 特殊处理404响应，确保返回空响应体且不设置Content-Type
-        if (status_code == 404) {
-            response_body = "";
-            
-            // 创建响应
-            struct MHD_Response* response = MHD_create_response_from_buffer(
-                0, nullptr, MHD_RESPMEM_PERSISTENT);
-                
-            // 发送响应
-            int ret = MHD_queue_response(connection, status_code, response);
-            MHD_destroy_response(response);
 
-            // 清理
-            delete request_body;
-            *con_cls = nullptr;
-
-            return ret;
-        }
-        
         // 创建响应
         struct MHD_Response* response = MHD_create_response_from_buffer(
             response_body.size(), (void*)response_body.c_str(), MHD_RESPMEM_MUST_COPY);
@@ -97,18 +78,15 @@ public:
     }
 
     bool start() {
-        // 创建MHD守护进程
-        // 优化线程池配置以提高并发性能
+        // 创建MHD守护进程，设置线程池大小为64
         daemon_ = MHD_start_daemon(
-            MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_EPOLL | MHD_USE_TCP_FASTOPEN,
+            MHD_USE_THREAD_PER_CONNECTION,
             port_,
             nullptr, nullptr,
             &HttpServerLibmicrohttpd::staticHandlerCallback,
             this,
-            MHD_OPTION_THREAD_POOL_SIZE, 16,  // 增加线程池大小到16以提高并发
-            MHD_OPTION_CONNECTION_TIMEOUT, 5,  // 减少连接超时到5秒
-            MHD_OPTION_LISTENING_ADDRESS_REUSE, 1,  // 允许地址重用
-            MHD_OPTION_SOCK_ADDR, nullptr,  // 监听所有接口
+            MHD_OPTION_THREAD_POOL_SIZE, 64,
+            MHD_OPTION_CONNECTION_TIMEOUT, 5,  // 设置连接超时为5秒
             MHD_OPTION_END);
 
         return (daemon_ != nullptr);

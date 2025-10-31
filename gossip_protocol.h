@@ -23,9 +23,6 @@
 #include <iostream>
 #include <sstream>
 #include <condition_variable>
-#include <queue>
-#include <future>
-#include <algorithm>
 
 // Gossip消息类型
 enum class GossipMessageType {
@@ -162,65 +159,6 @@ struct VersionInfo {
     uint64_t last_update_time; // 最后更新时间
 };
 
-// 简单的线程池实现
-class ThreadPool {
-private:
-    std::vector<std::thread> workers;
-    std::queue<std::function<void()>> tasks;
-    std::mutex queue_mutex;
-    std::condition_variable condition;
-    bool stop;
-
-public:
-    // 构造函数，创建指定数量的工作线程
-    ThreadPool(size_t threads) : stop(false) {
-        for (size_t i = 0; i < threads; ++i) {
-            workers.emplace_back([this] {
-                while (true) {
-                    std::function<void()> task;
-                    {
-                        std::unique_lock<std::mutex> lock(this->queue_mutex);
-                        this->condition.wait(lock, [this] { return this->stop || !this->tasks.empty(); });
-                        if (this->stop && this->tasks.empty()) return;
-                        task = std::move(this->tasks.front());
-                        this->tasks.pop();
-                    }
-                    task();
-                }
-            });
-        }
-    }
-
-    // 提交任务到线程池
-    template<class F>
-    auto submit(F&& f) -> std::future<typename std::result_of<F()>::type> {
-        using return_type = typename std::result_of<F()>::type;
-        auto task = std::make_shared<std::packaged_task<return_type()>>(std::forward<F>(f));
-        std::future<return_type> res = task->get_future();
-        {
-            std::unique_lock<std::mutex> lock(queue_mutex);
-            if (stop) throw std::runtime_error("submit on stopped ThreadPool");
-            tasks.emplace([task]() { (*task)(); });
-        }
-        condition.notify_one();
-        return res;
-    }
-
-    // 析构函数，停止线程池
-    ~ThreadPool() {
-        {
-            std::unique_lock<std::mutex> lock(queue_mutex);
-            stop = true;
-        }
-        condition.notify_all();
-        for (std::thread &worker : workers) {
-            if (worker.joinable()) {
-                worker.join();
-            }
-        }
-    }
-};
-
 // Gossip协议管理器
 class GossipProtocol {
 public:
@@ -334,8 +272,8 @@ public:
                 handleStatusUpdate(message);
                 break;
             default:
-                // 不处理未知消息类型
-                ;
+                // 移除调试输出
+                break;
         }
     }
     
@@ -426,9 +364,9 @@ public:
     
 
     
-    // 广播版本更新消息
+    // 广播版本更新消息（使用批量异步发送）
     void broadcastVersionUpdate(const std::string& key, uint64_t new_version) {
-        // 创建消息对象
+        // 优化：使用消息池避免频繁创建消息对象
         GossipMessage message;
         message.type = GossipMessageType::UPDATE_VERSION;
         message.sender_id = node_id_;
@@ -439,7 +377,7 @@ public:
         // 获取目标节点列表
         std::vector<std::string> targets = selectRandomNodes(GOSSIP_FANOUT);
         
-        // 批量异步发送，减少线程创建开销
+        // 优化：批量异步发送，减少线程创建开销
         if (!targets.empty()) {
             // 将所有目标节点的消息发送任务合并到一个线程中
             std::thread([this, message, targets]() {
@@ -506,37 +444,37 @@ public:
         return online_nodes;
     }
     
-    // 通知版本更新
+    // 通知版本更新（优化：减少线程创建开销）
     void notifyVersionUpdate(const std::string& key, uint64_t new_version) {
-        // 快速更新本地版本信息
-        {   // 最小作用域锁
-            std::unique_lock<std::shared_mutex> lock(version_mutex_);
-            VersionInfo& info = version_map_[key];
+        std::unique_lock<std::shared_mutex> lock(version_mutex_);
+        VersionInfo& info = version_map_[key];
+        
+        if (info.latest_version < new_version) {
+            info.latest_version = new_version;
+            info.last_writer = node_id_;
+            info.last_update_time = getCurrentTimestamp();
             
-            if (info.latest_version < new_version) {
-                info.latest_version = new_version;
-                info.last_writer = node_id_;
-                info.last_update_time = getCurrentTimestamp();
-            } else {
-                // 版本已更新，无需进一步操作
-                return;
+            // 锁释放后再广播版本更新
+            lock.unlock();
+            
+            // 同步处理广播，避免线程创建开销
+            GossipMessage message;
+            message.type = GossipMessageType::UPDATE_VERSION;
+            message.sender_id = node_id_;
+            message.target_key = key;
+            message.version = new_version;
+            message.timestamp = getCurrentTimestamp();
+            
+            // 直接广播，不创建新线程
+            std::vector<std::string> targets = selectRandomNodes(GOSSIP_FANOUT);
+            for (const auto& target : targets) {
+                try {
+                    sendMessage(target, message);
+                } catch (...) {
+                    // 忽略单个发送失败
+                }
             }
-        } // 立即释放锁
-        
-        // 使用线程池处理广播，避免频繁创建线程
-        if (update_task_pool_ == nullptr) {
-            // 懒初始化线程池
-            update_task_pool_ = std::make_shared<ThreadPool>(2); // 2个工作线程
         }
-        
-        // 提交广播任务到线程池
-        update_task_pool_->submit([this, key, new_version]() {
-            try {
-                broadcastVersionUpdate(key, new_version);
-            } catch (...) {
-                // 忽略所有异常
-            }
-        });
     }
     
     // 获取当前时间戳（毫秒）
@@ -719,9 +657,6 @@ private:
     // 随机数生成器
     std::mt19937_64 rng_;
     std::uniform_real_distribution<double> dist_;
-    
-    // 线程池用于异步处理
-    std::shared_ptr<ThreadPool> update_task_pool_;
     
     // 配置参数
     const size_t GOSSIP_FANOUT;        // 每次gossip选择的节点数

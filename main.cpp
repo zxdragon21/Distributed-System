@@ -8,7 +8,6 @@
 #include <iostream>
 #include <string>
 #include "cache_server.h"
-#include "node_manager.h"
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
@@ -41,7 +40,7 @@ int main(int argc, char* argv[]) {
     });
     
     try {
-        CacheServer server(node_id, port, std::to_string(27080 + node_index - 1));
+        CacheServer server(node_id, port);
         std::cout << "CacheServer created successfully, starting run..." << std::endl;
         server.run();
         
